@@ -7286,6 +7286,33 @@ static uint16_t nvme_dbbuf_config(NvmeCtrl *n, const NvmeRequest *req)
     return NVME_SUCCESS;
 }
 
+/* 
+ * Wrapper functions to adapt to the available SPDM socket API
+ * The original patch expected spdm_socket_send/receive functions
+ * but we only have spdm_socket_rsp which does both send+receive
+ */
+static bool spdm_socket_send(int socket, uint32_t command, 
+                           uint32_t transport_type, void *buffer, 
+                           uint32_t length)
+{
+    uint8_t response[SPDM_SOCKET_MAX_MSG_STATUS_LEN];
+    uint32_t response_len;
+    
+    response_len = spdm_socket_rsp(socket, transport_type, buffer, length,
+                                  response, sizeof(response));
+    return response_len > 0;
+}
+
+static uint32_t spdm_socket_receive(int socket, uint32_t transport_type,
+                                  void *buffer, uint32_t max_length)
+{
+    /* For receive operations, we send an empty request */
+    uint8_t empty_req = 0;
+    
+    return spdm_socket_rsp(socket, transport_type, &empty_req, 0,
+                          buffer, max_length);
+}
+
 static uint16_t nvme_sec_prot_spdm_send(NvmeCtrl *n, NvmeRequest *req)
 {
     StorageSpdmTransportHeader hdr = {0};
@@ -8955,11 +8982,12 @@ static bool nvme_init_pci(NvmeCtrl *n, PCIDevice *pci_dev, Error **errp)
 
     /* SPDM Initialisation */
     if (pci_dev->spdm_port) {
-        switch  (nvme_get_spdm_trans_type(pci_dev)) {
+        uint16_t doe_offset = n->params.sriov_max_vfs ?
+                                PCI_CONFIG_SPACE_SIZE + PCI_ARI_SIZEOF
+                                : PCI_CONFIG_SPACE_SIZE;
+
+        switch (nvme_get_spdm_trans_type(pci_dev)) {
             case SPDM_SOCKET_TRANSPORT_TYPE_PCI_DOE:
-                uint16_t doe_offset = n->params.sriov_max_vfs ?
-                                        PCI_CONFIG_SPACE_SIZE + PCI_ARI_SIZEOF
-                                        : PCI_CONFIG_SPACE_SIZE;       
                 pcie_doe_init(pci_dev, &pci_dev->doe_spdm, doe_offset,
                             doe_spdm_prot, true, 0);
                 pci_dev->doe_spdm.spdm_socket = spdm_socket_connect(
@@ -8976,16 +9004,6 @@ static bool nvme_init_pci(NvmeCtrl *n, PCIDevice *pci_dev, Error **errp)
                 break;
             default:
                 return false;
-        }
-
-        pcie_doe_init(pci_dev, &pci_dev->doe_spdm, doe_offset,
-                      doe_spdm_prot, true, 0);
-
-        pci_dev->doe_spdm.spdm_socket = spdm_socket_connect(pci_dev->spdm_port,
-                                                            errp);
-
-        if (pci_dev->doe_spdm.spdm_socket < 0) {
-            return false;
         }
     }
 
