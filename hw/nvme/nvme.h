@@ -648,6 +648,7 @@ typedef struct NvmeCtrl {
     } next_pri_ctrl_cap;    /* These override pri_ctrl_cap after reset */
     uint32_t    dn; /* Disable Normal */
     NvmeAtomic  atomic;
+    bool        tio_run; /* TIO (TEE I/O) enabled state */
 } NvmeCtrl;
 
 typedef enum NvmeResetType {

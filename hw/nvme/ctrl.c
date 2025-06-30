@@ -880,6 +880,12 @@ max_mappings_exceeded:
 
 static inline bool nvme_addr_is_dma(NvmeCtrl *n, hwaddr addr)
 {
+    // When TIO is disabled (tio_run = false), force bounce buffers for all addresses
+    if (!n->tio_run) {
+        return false;
+    }
+
+    // When TIO is enabled (tio_run = true), use normal DMA behavior
     return !(nvme_addr_is_cmb(n, addr) || nvme_addr_is_pmr(n, addr));
 }
 
@@ -9089,6 +9095,7 @@ static const Property nvme_props[] = {
     DEFINE_PROP_UINT16("atomic.awun", NvmeCtrl, params.atomic_awun, 0),
     DEFINE_PROP_UINT16("atomic.awupf", NvmeCtrl, params.atomic_awupf, 0),
     DEFINE_PROP_BOOL("ocp", NvmeCtrl, params.ocp, false),
+    DEFINE_PROP_BOOL("x-tio", NvmeCtrl, tio_run, false),
 };
 
 static void nvme_get_smart_warning(Object *obj, Visitor *v, const char *name,
