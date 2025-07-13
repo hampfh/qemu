@@ -882,11 +882,20 @@ static inline bool nvme_addr_is_dma(NvmeCtrl *n, hwaddr addr)
 {
     // When TIO is disabled (tio_run = false), force bounce buffers for all addresses
     if (!n->tio_run) {
+        trace_nvme_dma_mode_disabled();
         return false;
     }
 
+    bool is_dma = !(nvme_addr_is_cmb(n, addr) || nvme_addr_is_pmr(n, addr));
+
+    if (is_dma) {
+        trace_nvme_dma_mode_enabled();
+    } else {
+        trace_nvme_dma_mode_disabled();
+    }
+
     // When TIO is enabled (tio_run = true), use normal DMA behavior
-    return !(nvme_addr_is_cmb(n, addr) || nvme_addr_is_pmr(n, addr));
+    return is_dma;
 }
 
 static uint16_t nvme_map_prp(NvmeCtrl *n, NvmeSg *sg, uint64_t prp1,
