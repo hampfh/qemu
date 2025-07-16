@@ -886,6 +886,7 @@ static inline bool nvme_addr_is_dma(NvmeCtrl *n, hwaddr addr)
         return false;
     }
 
+    // When TIO is enabled (tio_run = true), use normal DMA behavior
     bool is_dma = !(nvme_addr_is_cmb(n, addr) || nvme_addr_is_pmr(n, addr));
 
     if (is_dma) {
@@ -894,7 +895,6 @@ static inline bool nvme_addr_is_dma(NvmeCtrl *n, hwaddr addr)
         trace_nvme_dma_mode_disabled();
     }
 
-    // When TIO is enabled (tio_run = true), use normal DMA behavior
     return is_dma;
 }
 
@@ -1364,6 +1364,11 @@ static uint16_t nvme_tx_interleaved(NvmeCtrl *n, NvmeSg *sg, uint8_t *ptr,
     return NVME_SUCCESS;
 }
 
+// THESIS BOOKMARK: nvme_tx
+/**
+ * The nvme_tx function performs data transfers between the NVMe controller and host memory, supporting both directions
+ * It can handle two ways NVME_TX_H2C and NVME_TX_C2H
+ */
 static uint16_t nvme_tx(NvmeCtrl *n, NvmeSg *sg, void *ptr, uint32_t len,
                         NvmeTxDirection dir)
 {
@@ -1401,6 +1406,11 @@ static uint16_t nvme_tx(NvmeCtrl *n, NvmeSg *sg, void *ptr, uint32_t len,
     return NVME_SUCCESS;
 }
 
+// THESIS BOOKMARK: nvme_c2h
+/**
+ * The nvme_c2h function is used to transfer data from the NVMe controller to the host
+ * It is called when the NVMe controller is receiving data from the host
+ */
 static inline uint16_t nvme_c2h(NvmeCtrl *n, void *ptr, uint32_t len,
                                 NvmeRequest *req)
 {
@@ -1414,6 +1424,11 @@ static inline uint16_t nvme_c2h(NvmeCtrl *n, void *ptr, uint32_t len,
     return nvme_tx(n, &req->sg, ptr, len, NVME_TX_DIRECTION_FROM_DEVICE);
 }
 
+// THESIS BOOKMARK: nvme_h2c
+/**
+ * The nvme_h2c function is used to transfer data from the host to the NVMe controller
+ * It is called when the NVMe controller is sending data to the host
+ */
 static inline uint16_t nvme_h2c(NvmeCtrl *n, void *ptr, uint32_t len,
                                 NvmeRequest *req)
 {
@@ -3724,6 +3739,8 @@ static void nvme_do_write_fdp(NvmeCtrl *n, NvmeRequest *req, uint64_t slba,
     }
 }
 
+
+// THESIS BOOKMARK: nvme_do_write
 static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
                               bool wrz)
 {
@@ -4673,6 +4690,10 @@ static uint16_t nvme_io_cmd_zoned(NvmeCtrl *n, NvmeRequest *req)
     return __nvme_io_cmd_nvm(n, req);
 }
 
+// THESIS BOOKMARK: nvme_io_cmd_nvm
+/**
+ * This method is the top level handler for all NVMe commands
+ */
 static uint16_t nvme_io_cmd(NvmeCtrl *n, NvmeRequest *req)
 {
     NvmeNamespace *ns;
@@ -7498,6 +7519,11 @@ static NvmeAtomic *nvme_get_atomic(NvmeCtrl *n, NvmeCmd *cmd)
     return NULL;
 }
 
+// THESIS BOOKMARK: nvme_process_sq
+/**
+ * The nvme_process_sq function is used to process the submission queue
+ * It is called when the NVMe controller is sending data to the host
+ */
 static void nvme_process_sq(void *opaque)
 {
     NvmeSQueue *sq = opaque;
