@@ -317,6 +317,7 @@ static const uint32_t nvme_cse_iocs_zoned_default[256] = {
 static void nvme_process_sq(void *opaque);
 static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst);
 static inline uint64_t nvme_get_timestamp(const NvmeCtrl *n);
+static void nvme_run_through_bounce_buffer(NvmeCtrl *n, NvmeRequest *req, uint64_t data_size);
 
 static uint16_t nvme_sqid(NvmeRequest *req)
 {
@@ -994,8 +995,8 @@ unmap:
  * number of bytes mapped in len.
  */
 static uint16_t nvme_map_sgl_data(NvmeCtrl *n, NvmeSg *sg,
-                                  NvmeSglDescriptor *segment, uint64_t nsgld,
-                                  size_t *len, NvmeCmd *cmd)
+                                   NvmeSglDescriptor *segment, uint64_t nsgld,
+                                   size_t *len, NvmeCmd *cmd)
 {
     dma_addr_t addr, trans_len;
     uint32_t dlen;
@@ -1297,9 +1298,9 @@ static uint16_t nvme_map_mdata(NvmeCtrl *n, uint32_t nlb, NvmeRequest *req)
 }
 
 static uint16_t nvme_tx_interleaved(NvmeCtrl *n, NvmeSg *sg, uint8_t *ptr,
-                                    uint32_t len, uint32_t bytes,
-                                    int32_t skip_bytes, int64_t offset,
-                                    NvmeTxDirection dir)
+                                     uint32_t len, uint32_t bytes,
+                                     int32_t skip_bytes, int64_t offset,
+                                     NvmeTxDirection dir)
 {
     hwaddr addr;
     uint32_t trans_len, count = bytes;
@@ -3620,6 +3621,28 @@ out:
     return status;
 }
 
+
+static void nvme_run_through_bounce_buffer(NvmeCtrl *n, NvmeRequest *req, uint64_t data_size) { 
+    uint8_t *bounce_buffer = g_malloc(data_size);
+    if (req->sg.flags & NVME_SG_DMA) {
+        req->sg.qsg.qiov.buffer = bounce_buffer;
+        req->sg.qsg.qiov.size = data_size;
+    } else {
+        req->sg.iov.buffer = bounce_buffer;
+        req->sg.iov.size = data_size;
+    }
+
+    memcpy(bounce_buffer, req->sg.iov.buffer, data_size);
+
+    // Copy back to original buffer
+    if (req->sg.flags & NVME_SG_DMA) {
+        memcpy(req->sg.qsg.qiov.buffer, bounce_buffer, data_size);
+    } else {
+        memcpy(req->sg.iov.buffer, bounce_buffer, data_size);
+    }
+    g_free(bounce_buffer);
+}
+
 static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
@@ -3731,27 +3754,6 @@ static void nvme_do_write_fdp(NvmeCtrl *n, NvmeRequest *req, uint64_t slba,
         nlb -= ru->ruamw;
         nvme_update_ruh(n, ns, pid);
     }
-}
-
-static void nvme_run_through_bounce_buffer(NvmeCtrl *n, NvmeRequest *req, uint64_t data_size) { 
-    uint8_t *bounce_buffer = g_malloc(data_size);
-    if (req->sg.flags & NVME_SG_DMA) {
-        req->sg.qsg.qiov.buffer = bounce_buffer;
-        req->sg.qsg.qiov.size = data_size;
-    } else {
-        req->sg.iov.buffer = bounce_buffer;
-        req->sg.iov.size = data_size;
-    }
-
-    memcpy(bounce_buffer, req->sg.iov.buffer, data_size);
-
-    // Copy back to original buffer
-    if (req->sg.flags & NVME_SG_DMA) {
-        memcpy(req->sg.qsg.qiov.buffer, bounce_buffer, data_size);
-    } else {
-        memcpy(req->sg.iov.buffer, bounce_buffer, data_size);
-    }
-    g_free(bounce_buffer);
 }
 
 // THESIS BOOKMARK: nvme_do_write
