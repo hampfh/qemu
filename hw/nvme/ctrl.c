@@ -880,13 +880,7 @@ max_mappings_exceeded:
 
 static inline bool nvme_addr_is_dma(NvmeCtrl *n, hwaddr addr)
 {
-    // When TIO is disabled (tio_run = false), force bounce buffers for all addresses
-    if (!n->tio_run) {
-        trace_nvme_dma_mode_disabled();
-        return false;
-    }
-
-    // When TIO is enabled (tio_run = true), use normal DMA behavior
+    // Normal DMA behavior - check for special memory regions
     bool is_dma = !(nvme_addr_is_cmb(n, addr) || nvme_addr_is_pmr(n, addr));
 
     if (is_dma) {
@@ -1364,11 +1358,6 @@ static uint16_t nvme_tx_interleaved(NvmeCtrl *n, NvmeSg *sg, uint8_t *ptr,
     return NVME_SUCCESS;
 }
 
-// THESIS BOOKMARK: nvme_tx
-/**
- * The nvme_tx function performs data transfers between the NVMe controller and host memory, supporting both directions
- * It can handle two ways NVME_TX_H2C and NVME_TX_C2H
- */
 static uint16_t nvme_tx(NvmeCtrl *n, NvmeSg *sg, void *ptr, uint32_t len,
                         NvmeTxDirection dir)
 {
@@ -3697,6 +3686,11 @@ static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
     block_acct_start(blk_get_stats(blk), &req->acct, data_size,
                      BLOCK_ACCT_READ);
     nvme_blk_read(blk, data_offset, BDRV_SECTOR_SIZE, nvme_rw_cb, req);
+
+    if (!n->tio_run) {
+        nvme_run_through_bounce_buffer(n, req, data_size);
+    }
+
     return NVME_NO_COMPLETE;
 
 invalid:
@@ -3739,6 +3733,26 @@ static void nvme_do_write_fdp(NvmeCtrl *n, NvmeRequest *req, uint64_t slba,
     }
 }
 
+static void nvme_run_through_bounce_buffer(NvmeCtrl *n, NvmeRequest *req, uint64_t data_size) { 
+    uint8_t *bounce_buffer = g_malloc(data_size);
+    if (req->sg.flags & NVME_SG_DMA) {
+        req->sg.qsg.qiov.buffer = bounce_buffer;
+        req->sg.qsg.qiov.size = data_size;
+    } else {
+        req->sg.iov.buffer = bounce_buffer;
+        req->sg.iov.size = data_size;
+    }
+
+    memcpy(bounce_buffer, req->sg.iov.buffer, data_size);
+
+    // Copy back to original buffer
+    if (req->sg.flags & NVME_SG_DMA) {
+        memcpy(req->sg.qsg.qiov.buffer, bounce_buffer, data_size);
+    } else {
+        memcpy(req->sg.iov.buffer, bounce_buffer, data_size);
+    }
+    g_free(bounce_buffer);
+}
 
 // THESIS BOOKMARK: nvme_do_write
 static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
@@ -3757,6 +3771,10 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
     NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
     BlockBackend *blk = ns->blkconf.blk;
     uint16_t status;
+
+    if (!n->tio_run) {
+        nvme_run_through_bounce_buffer(n, req, data_size);
+    }
 
     if (nvme_ns_ext(ns) && !(NVME_ID_CTRL_CTRATT_MEM(n->id_ctrl.ctratt))) {
         mapped_size += nvme_m2b(ns, nlb);
@@ -8116,6 +8134,10 @@ static uint64_t nvme_mmio_read(void *opaque, hwaddr addr, unsigned size)
     return ldn_le_p(ptr + addr, size);
 }
 
+// this is the doorbell write function
+/**
+ * doorbell register is a register for notifying QEMU about the controller of new activity
+ */
 static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
 {
     PCIDevice *pci = PCI_DEVICE(n);
