@@ -3632,7 +3632,16 @@ static void nvme_run_through_bounce_buffer(NvmeCtrl *n, NvmeRequest *req, uint64
         req->sg.iov.size = data_size;
     }
 
-    memcpy(bounce_buffer, req->sg.iov.buffer, data_size);
+    // Copy into bounce buffer
+    if (req->sg.flags & NVME_SG_DMA) {
+        memcpy(bounce_buffer, req->sg.qsg.qiov.buffer, data_size);
+    } else {
+        memcpy(bounce_buffer, req->sg.iov.buffer, data_size);
+    }
+
+    /**
+     * TEE I/O processing would happen here
+     */
 
     // Copy back to original buffer
     if (req->sg.flags & NVME_SG_DMA) {
