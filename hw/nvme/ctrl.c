@@ -3622,33 +3622,62 @@ out:
 }
 
 
+/**
+ * This function no matter the underlying data format copies over all
+ * payload over to a bounce buffer, then copies it back to the original source.
+ */
 static void nvme_run_through_bounce_buffer(NvmeCtrl *n, NvmeRequest *req, uint64_t data_size) { 
+
+    // Bounce buffer
     uint8_t *bounce_buffer = g_malloc(data_size);
+
+    // DMA bounce buffer copy
     if (req->sg.flags & NVME_SG_DMA) {
-        req->sg.qsg.qiov.buffer = bounce_buffer;
-        req->sg.qsg.qiov.size = data_size;
-    } else {
-        req->sg.iov.buffer = bounce_buffer;
-        req->sg.iov.size = data_size;
+        dma_addr_t residual;
+        const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+
+        // Write from DMA data struct to bounce buffer
+        dma_buf_write(bounce_buffer, data_size, &residual, &req->sg.qsg, attrs);
+        if (unlikely(residual != 0)) {
+            trace_nvme_bounce_buffer_copy_error();
+            g_free(bounce_buffer);
+            return;
+        }
+
+        /**
+         * TEE I/O processing would happen here
+         */
+
+        // Read from bounce buffer to DMA data struct
+        dma_buf_read(bounce_buffer, data_size, &residual, &req->sg.qsg, attrs);
+        if (unlikely(residual != 0)) {
+            trace_nvme_bounce_buffer_copy_error();
+            g_free(bounce_buffer);
+            return;
+        }
+    } else { // Default bounce buffer copy 
+        size_t bytes;
+        bytes = qemu_iovec_to_buf(&req->sg.iov, 0, bounce_buffer, data_size);
+        if (unlikely(bytes != data_size)) {
+            trace_nvme_bounce_buffer_copy_error();
+            g_free(bounce_buffer);
+            return;
+        }
+
+        /**
+         * TEE I/O processing would happen here
+         */
+
+        // Copy back to original buffer
+        bytes = qemu_iovec_from_buf(&req->sg.iov, 0, bounce_buffer, data_size);
+        if (unlikely(bytes != data_size)) {
+            trace_nvme_bounce_buffer_copy_error();
+            g_free(bounce_buffer);
+            return;
+        }
+
     }
 
-    // Copy into bounce buffer
-    if (req->sg.flags & NVME_SG_DMA) {
-        memcpy(bounce_buffer, req->sg.qsg.qiov.buffer, data_size);
-    } else {
-        memcpy(bounce_buffer, req->sg.iov.buffer, data_size);
-    }
-
-    /**
-     * TEE I/O processing would happen here
-     */
-
-    // Copy back to original buffer
-    if (req->sg.flags & NVME_SG_DMA) {
-        memcpy(req->sg.qsg.qiov.buffer, bounce_buffer, data_size);
-    } else {
-        memcpy(req->sg.iov.buffer, bounce_buffer, data_size);
-    }
     g_free(bounce_buffer);
 }
 
