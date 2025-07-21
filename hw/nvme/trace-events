@@ -221,3 +221,4 @@ pci_nvme_ub_too_many_mappings(void) "too many prp/sgl mappings"
 # nvme/ctrl.c
 nvme_dma_mode_enabled(void) "DMA enabled"
 nvme_dma_mode_disabled(void) "Bounce buffer used"
+nvme_bounce_buffer_copy_error(void) "Bounce buffer copy error"
