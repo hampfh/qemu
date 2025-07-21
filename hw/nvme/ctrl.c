@@ -3678,6 +3678,8 @@ static void nvme_run_through_bounce_buffer(NvmeCtrl *n, NvmeRequest *req, uint64
 
     }
 
+    trace_nvme_bounce_buffer_copy_complete();
+
     g_free(bounce_buffer);
 }
 
