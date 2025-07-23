@@ -213,6 +213,10 @@
 #include "dif.h"
 #include "trace.h"
 
+#include "crypto/hash.h"
+#include "crypto/cipher.h"
+#include "qemu/rcu.h"
+
 #define NVME_MAX_IOQPAIRS 0xffff
 #define NVME_DB_SIZE  4
 #define NVME_SPEC_VER 0x00010400
@@ -3621,6 +3625,94 @@ out:
     return status;
 }
 
+static void nvme_emulate_secure_bounce_buffer_crypto(NvmeCtrl *n, NvmeRequest *req, uint64_t data_size, uint8_t *bounce_buffer) {
+    // Multiple encryption rounds
+    static const uint8_t aes_key1[32] = {
+        0x60, 0x3D, 0xEB, 0x10, 0x15, 0xCA, 0x71, 0xBE, 
+        0x2B, 0x73, 0xAE, 0xF0, 0x85, 0x7D, 0x77, 0x81,
+        0x1F, 0x35, 0x2C, 0x07, 0x3B, 0x61, 0x08, 0xD7, 
+        0x2D, 0x98, 0x10, 0xA3, 0x09, 0x14, 0xDF, 0xF4
+    };
+    
+    static const uint8_t aes_key2[32] = {
+        0xF4, 0xDF, 0x14, 0x09, 0xA3, 0x10, 0x98, 0x2D,
+        0xD7, 0x08, 0x61, 0x3B, 0x07, 0x2C, 0x35, 0x1F,
+        0x81, 0x77, 0x7D, 0x85, 0xF0, 0xAE, 0x73, 0x2B,
+        0xBE, 0x71, 0xCA, 0x15, 0x10, 0xEB, 0x3D, 0x60
+    };
+
+    if (data_size < 16) {
+        trace_nvme_encryption_failed(1);
+        return;
+    }
+
+    // Handle unaligned data by padding to block boundary
+    size_t aligned_size = ((data_size + 15) / 16) * 16;
+    uint8_t *aligned_buffer = g_malloc0(aligned_size);
+    uint8_t *temp_buffer1 = g_malloc(aligned_size);
+    uint8_t *temp_buffer2 = g_malloc(aligned_size);
+    
+    // Copy original data to aligned buffer
+    memcpy(aligned_buffer, bounce_buffer, data_size);
+    
+    // First encryption round with AES-256
+    QCryptoCipher *cipher1 = qcrypto_cipher_new(QCRYPTO_CIPHER_ALGO_AES_256,
+                                                QCRYPTO_CIPHER_MODE_CBC,
+                                                aes_key1, sizeof(aes_key1),
+                                                &error_abort);
+    if (!cipher1) {
+        trace_nvme_encryption_failed(2);
+        goto cleanup;
+    }
+    
+    static const uint8_t iv1[16] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                                    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F};
+    qcrypto_cipher_setiv(cipher1, iv1, sizeof(iv1), &error_abort);
+    qcrypto_cipher_encrypt(cipher1, aligned_buffer, temp_buffer1, aligned_size, &error_abort);
+    
+    QCryptoCipher *cipher2 = qcrypto_cipher_new(QCRYPTO_CIPHER_ALGO_AES_256,
+                                                QCRYPTO_CIPHER_MODE_CBC,
+                                                aes_key2, sizeof(aes_key2),
+                                                &error_abort);
+    if (!cipher2) {
+        qcrypto_cipher_free(cipher1);
+        trace_nvme_encryption_failed(3);
+        goto cleanup;
+    }
+    
+    static const uint8_t iv2[16] = {0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
+                                    0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00};
+    qcrypto_cipher_setiv(cipher2, iv2, sizeof(iv2), &error_abort);
+    qcrypto_cipher_encrypt(cipher2, temp_buffer1, temp_buffer2, aligned_size, &error_abort);
+    
+    // Simulate processing encrypted data (add computational overhead)
+    volatile uint32_t checksum = 0;
+    for (size_t i = 0; i < aligned_size; i += 4) {
+        checksum ^= *(uint32_t*)(temp_buffer2 + i);
+        // Add some bit manipulation overhead
+        checksum = (checksum << 13) | (checksum >> 19);
+    }
+    
+    // Decrypt in reverse order
+    qcrypto_cipher_setiv(cipher2, iv2, sizeof(iv2), &error_abort);
+    qcrypto_cipher_decrypt(cipher2, temp_buffer2, temp_buffer1, aligned_size, &error_abort);
+    
+    qcrypto_cipher_setiv(cipher1, iv1, sizeof(iv1), &error_abort);
+    qcrypto_cipher_decrypt(cipher1, temp_buffer1, aligned_buffer, aligned_size, &error_abort);
+    
+    // Copy back only original data size
+    memcpy(bounce_buffer, aligned_buffer, data_size);
+    
+    qcrypto_cipher_free(cipher1);
+    qcrypto_cipher_free(cipher2);
+    trace_nvme_encryption_failed(0);
+
+    
+cleanup:
+    g_free(aligned_buffer);
+    g_free(temp_buffer1);
+    g_free(temp_buffer2);
+}
 
 /**
  * This function no matter the underlying data format copies over all
@@ -3628,59 +3720,151 @@ out:
  */
 static void nvme_run_through_bounce_buffer(NvmeCtrl *n, NvmeRequest *req, uint64_t data_size) { 
 
-    // Bounce buffer
-    uint8_t *bounce_buffer = g_malloc(data_size);
+    // Safety, if no data to copy, return
+    if (data_size == 0) {
+        trace_nvme_bounce_buffer_copy_error(-1);
+        return;
+    }
+
+    // Get actual iovec size for non-DMA path to ensure proper allocation
+    size_t allocation_size = data_size;
+    if (!(req->sg.flags & NVME_SG_DMA)) {
+        size_t actual_iov_size = req->sg.iov.size;
+        allocation_size = MAX(data_size, actual_iov_size);
+    }
+
+    // Bounce buffer - allocate based on max size needed
+    uint8_t *bounce_buffer = g_malloc(allocation_size);
+    uint8_t *bounce_buffer_intermediate = g_malloc(allocation_size);
 
     // DMA bounce buffer copy
     if (req->sg.flags & NVME_SG_DMA) {
-        dma_addr_t residual;
         const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+        MemTxResult result;
 
-        // Write from DMA data struct to bounce buffer
-        dma_buf_write(bounce_buffer, data_size, &residual, &req->sg.qsg, attrs);
-        if (unlikely(residual != 0)) {
-            trace_nvme_bounce_buffer_copy_error();
+        size_t offset = 0;
+        // Manually copy from scatter-gather entries, block by block
+        for (int i = 0; i < req->sg.qsg.nsg && offset < data_size; i++) {
+            dma_addr_t addr = req->sg.qsg.sg[i].base;
+            dma_addr_t len = req->sg.qsg.sg[i].len;
+            size_t copy_len = MIN(len, data_size - offset);
+            
+            // Copy from DMA address to bounce buffer - this performs actual memory copy
+            result = dma_memory_read(req->sg.qsg.as, addr, bounce_buffer_intermediate + offset, copy_len, attrs);
+            if (result != MEMTX_OK) {
+                trace_nvme_bounce_buffer_copy_error(1);
+                g_free(bounce_buffer);
+                g_free(bounce_buffer_intermediate);
+                return;
+            }
+            memcpy(bounce_buffer + offset, bounce_buffer_intermediate + offset, copy_len);
+            
+            // Realistic bounce buffer overhead, validation and cache management
+            // Only do expensive operations periodically, not for every byte
+            if (copy_len > 64) {
+                volatile uint8_t checksum = 0;
+                for (size_t j = 0; j < copy_len; j += 64) {
+                    checksum ^= bounce_buffer[offset + j];  // Sample validation
+                }
+                (void)checksum;  // Prevent optimization
+            }
+            
+            offset += copy_len;
+        }
+        
+        if (offset != data_size) {
+            trace_nvme_missmatch_copy_resolution(1);
             g_free(bounce_buffer);
+            g_free(bounce_buffer_intermediate);
             return;
         }
+
+
+        // Clear intermediate buffer
+        memset(bounce_buffer_intermediate, 0, data_size);
 
         /**
-         * TEE I/O processing would happen here
+         * TEE I/O processing - simulate computational overhead
          */
+        nvme_emulate_secure_bounce_buffer_crypto(n, req, data_size, bounce_buffer);
+        // Emulate context switching by sleeping https://stackoverflow.com/a/22421360
+        g_usleep(5); // 5 microseconds
 
-        // Read from bounce buffer to DMA data struct
-        dma_buf_read(bounce_buffer, data_size, &residual, &req->sg.qsg, attrs);
-        if (unlikely(residual != 0)) {
-            trace_nvme_bounce_buffer_copy_error();
+        // Manually copy from bounce buffer back to scatter-gather entries
+        offset = 0;
+        for (int i = 0; i < req->sg.qsg.nsg && offset < data_size; i++) {
+            dma_addr_t addr = req->sg.qsg.sg[i].base;
+            dma_addr_t len = req->sg.qsg.sg[i].len;
+            size_t copy_len = MIN(len, data_size - offset);
+
+            memcpy(bounce_buffer_intermediate + offset, bounce_buffer + offset, copy_len);
+            
+            // Copy from intermediate buffer to DMA address
+            result = dma_memory_write(req->sg.qsg.as, addr, bounce_buffer_intermediate + offset, copy_len, attrs);
+            if (result != MEMTX_OK) {
+                trace_nvme_bounce_buffer_copy_error(2);
+                g_free(bounce_buffer);
+                g_free(bounce_buffer_intermediate);
+                return;
+            }
+            offset += copy_len;
+        }
+        
+        if (offset != data_size) {
+            trace_nvme_missmatch_copy_resolution(2);
             g_free(bounce_buffer);
+            g_free(bounce_buffer_intermediate);
             return;
         }
-    } else { // Default bounce buffer copy 
+        trace_nvme_dma_mode_enabled();
+    } else { // Default bounce buffer copy using iovec
         size_t bytes;
-        bytes = qemu_iovec_to_buf(&req->sg.iov, 0, bounce_buffer, data_size);
-        if (unlikely(bytes != data_size)) {
-            trace_nvme_bounce_buffer_copy_error();
+        size_t actual_iov_size = req->sg.iov.size;
+        
+        // Use the actual iovec size instead of calculated data_size
+        bytes = qemu_iovec_to_buf(&req->sg.iov, 0, bounce_buffer_intermediate, actual_iov_size);
+        if (unlikely(bytes != actual_iov_size)) {
+            trace_nvme_bounce_buffer_copy_error(3);
             g_free(bounce_buffer);
+            g_free(bounce_buffer_intermediate);
             return;
         }
+        
+        // Copy from intermediate to bounce buffer (use actual size)
+        memcpy(bounce_buffer, bounce_buffer_intermediate, actual_iov_size);
+        
+        // Realistic bounce buffer overhead, validation and cache management
+        if (actual_iov_size > 64) {
+            volatile uint8_t checksum = 0;
+            for (size_t j = 0; j < actual_iov_size; j += 64) {
+                checksum ^= bounce_buffer[j];  // Sample validation
+            }
+            (void)checksum;  // Prevent optimization
+        }
+        
+        // Clear intermediate buffer (use actual size)
+        memset(bounce_buffer_intermediate, 0, actual_iov_size);
 
         /**
-         * TEE I/O processing would happen here
+         * TEE I/O processing - simulate computational overhead
          */
+        nvme_emulate_secure_bounce_buffer_crypto(n, req, data_size, bounce_buffer);
 
-        // Copy back to original buffer
-        bytes = qemu_iovec_from_buf(&req->sg.iov, 0, bounce_buffer, data_size);
-        if (unlikely(bytes != data_size)) {
-            trace_nvme_bounce_buffer_copy_error();
+        // Copy back to original buffer (use actual size)
+        memcpy(bounce_buffer_intermediate, bounce_buffer, actual_iov_size);
+        
+        bytes = qemu_iovec_from_buf(&req->sg.iov, 0, bounce_buffer_intermediate, actual_iov_size);
+        if (unlikely(bytes != actual_iov_size)) {
+            trace_nvme_bounce_buffer_copy_error(4);
             g_free(bounce_buffer);
+            g_free(bounce_buffer_intermediate);
             return;
         }
-
+        trace_nvme_bounce_buffer_copy_complete();
     }
 
-    trace_nvme_bounce_buffer_copy_complete();
-
     g_free(bounce_buffer);
+    g_free(bounce_buffer_intermediate);
 }
 
 static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
